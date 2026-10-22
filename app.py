@@ -3,14 +3,19 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import threading
 import time
+from contextlib import contextmanager
+from datetime import datetime
 from collections import defaultdict, deque
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from flask import Flask, jsonify, request, send_from_directory
+from pywebpush import WebPushException, webpush
 
 ROOT = Path(__file__).resolve().parent
 
@@ -42,6 +47,34 @@ _rate_lock = threading.Lock()
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = MAX_BODY_BYTES
+DB_PATH = Path(os.environ.get("DATABASE_PATH", str(ROOT / "subscriptions.sqlite3")))
+_push_lock = threading.Lock()
+
+
+@contextmanager
+def _db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(DB_PATH, timeout=10)
+    connection.row_factory = sqlite3.Row
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _init_push_db():
+    with _db() as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS push_subscriptions (
+            endpoint TEXT PRIMARY KEY, subscription TEXT NOT NULL, reminder_time TEXT NOT NULL,
+            timezone TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, sent_date TEXT NOT NULL DEFAULT ''
+        )""")
+
+
+_init_push_db()
 
 
 @app.get("/")
@@ -61,9 +94,116 @@ def javascript():
     return send_from_directory(ROOT, "app.js", max_age=0)
 
 
+@app.get("/manifest.webmanifest")
+def manifest():
+    return send_from_directory(ROOT, "manifest.webmanifest", mimetype="application/manifest+json", max_age=3600)
+
+
+@app.get("/service-worker.js")
+def service_worker():
+    response = send_from_directory(ROOT, "service-worker.js", max_age=0)
+    response.headers["Service-Worker-Allowed"] = "/"
+    return response
+
+
+@app.get("/icon.svg")
+def app_icon():
+    return send_from_directory(ROOT, "icon.svg", mimetype="image/svg+xml", max_age=3600)
+
+
 @app.get("/api/health")
 def health():
-    return jsonify(ok=True, configured=bool(os.environ.get("GEMINI_API_KEY")))
+    return jsonify(ok=True, configured=bool(os.environ.get("GEMINI_API_KEY")), push_configured=bool(os.environ.get("VAPID_PUBLIC_KEY") and os.environ.get("VAPID_PRIVATE_KEY")))
+
+
+@app.get("/api/push/public-key")
+def push_public_key():
+    key = os.environ.get("VAPID_PUBLIC_KEY", "").strip()
+    if not key or not os.environ.get("VAPID_PRIVATE_KEY", "").strip():
+        return jsonify(error="Push notifications are not configured on the server."), 503
+    return jsonify(publicKey=key)
+
+
+@app.post("/api/push/subscribe")
+def push_subscribe():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify(error="Send a JSON request."), 400
+    subscription = data.get("subscription")
+    reminder_time = _text(data.get("time"), 5)
+    timezone = _text(data.get("timezone"), 80)
+    endpoint = subscription.get("endpoint") if isinstance(subscription, dict) else ""
+    if not isinstance(endpoint, str) or not endpoint.startswith("https://") or len(endpoint) > 2000:
+        return jsonify(error="A valid push subscription is required."), 400
+    if len(reminder_time) != 5 or reminder_time[2] != ":" or not reminder_time[:2].isdigit() or not reminder_time[3:].isdigit() or int(reminder_time[:2]) > 23 or int(reminder_time[3:]) > 59:
+        return jsonify(error="Choose a valid reminder time."), 400
+    try:
+        ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        return jsonify(error="A valid phone time zone is required."), 400
+    with _db() as db:
+        db.execute("""INSERT INTO push_subscriptions(endpoint,subscription,reminder_time,timezone,active,sent_date)
+            VALUES(?,?,?,?,1,'') ON CONFLICT(endpoint) DO UPDATE SET
+            subscription=excluded.subscription, reminder_time=excluded.reminder_time,
+            timezone=excluded.timezone, active=1""",
+            (endpoint, json.dumps(subscription), reminder_time, timezone))
+    return jsonify(ok=True)
+
+
+@app.post("/api/push/unsubscribe")
+def push_unsubscribe():
+    data = request.get_json(silent=True)
+    endpoint = data.get("endpoint", "") if isinstance(data, dict) else ""
+    if isinstance(endpoint, str):
+        with _db() as db:
+            db.execute("UPDATE push_subscriptions SET active=0 WHERE endpoint=?", (endpoint,))
+    return jsonify(ok=True)
+
+
+def _send_due_pushes():
+    public_key = os.environ.get("VAPID_PUBLIC_KEY", "").strip()
+    private_key = os.environ.get("VAPID_PRIVATE_KEY", "").strip()
+    if not public_key or not private_key:
+        return
+    with _push_lock, _db() as db:
+        subscriptions = db.execute("SELECT * FROM push_subscriptions WHERE active=1").fetchall()
+        for row in subscriptions:
+            try:
+                local_now = datetime.now(ZoneInfo(row["timezone"]))
+            except (ZoneInfoNotFoundError, ValueError):
+                continue
+            if local_now.strftime("%H:%M") < row["reminder_time"] or row["sent_date"] == local_now.date().isoformat():
+                continue
+            try:
+                webpush(
+                    subscription_info=json.loads(row["subscription"]),
+                    data=json.dumps({"title": "A little study time?", "body": "Your daily study reminder is ready. Open Daylight for a bite-sized discovery."}),
+                    vapid_private_key=private_key,
+                    vapid_claims={"sub": os.environ.get("VAPID_SUBJECT", "mailto:admin@example.com")},
+                    ttl=3600,
+                )
+                db.execute("UPDATE push_subscriptions SET sent_date=? WHERE endpoint=?", (local_now.date().isoformat(), row["endpoint"]))
+            except WebPushException as error:
+                status = getattr(getattr(error, "response", None), "status_code", None)
+                if status in (404, 410):
+                    db.execute("UPDATE push_subscriptions SET active=0 WHERE endpoint=?", (row["endpoint"],))
+                else:
+                    app.logger.warning("Could not deliver a scheduled push notification: %s", error)
+            except (ValueError, TypeError, KeyError):
+                app.logger.warning("A stored push subscription could not be read; disabling it.")
+                db.execute("UPDATE push_subscriptions SET active=0 WHERE endpoint=?", (row["endpoint"],))
+
+
+def _start_push_scheduler():
+    if os.environ.get("DISABLE_PUSH_SCHEDULER") == "1":
+        return
+    from apscheduler.schedulers.background import BackgroundScheduler
+    scheduler = BackgroundScheduler(daemon=True, timezone="UTC")
+    scheduler.add_job(_send_due_pushes, "interval", minutes=1, id="daily-study-push", max_instances=1, coalesce=True)
+    scheduler.start()
+
+
+_start_push_scheduler()
 
 
 def _rate_limit_exceeded(client_ip: str) -> bool:
